@@ -1,19 +1,22 @@
 name: CD
-
 on:
   push:
-    branches: ['master']
+    branches: [master]
+
+permissions:
+  contents: read
+  packages: write
 
 env:
-  GHCR_URL: ghcr.io # GitHub Container Registry
+  REGISTRY: ghcr.io
 
 jobs:
   cd:
-    name: Build & Push GitHub Package & Deploy on Render Docker Image
+    name: Build & Push GHCR + Trigger Render
     runs-on: ubuntu-22.04
 
     steps:
-      - name: ⬇️ Checkout repository
+      - name: ⬇️ Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -25,34 +28,49 @@ jobs:
           java-version: 21
           cache: maven
 
-      - name: 🏷️ Extract artifact from pom
-        run: |
-          echo "VERSION=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)" >> $GITHUB_ENV
-          echo "ARTIFACT=$(mvn help:evaluate -Dexpression=project.artifactId -q -DforceStdout)" >> $GITHUB_ENV
-          echo "OWNER_LC=${GITHUB_REPOSITORY_OWNER,,}" >> $GITHUB_ENV
-          echo "NAME_LC=$(echo "$ARTIFACT" | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
-          echo "REPOSITORY=${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
-          echo "IMAGE=ghcr.io/${OWNER_LC}/${NAME_LC}:${VERSION}" >> $GITHUB_ENV
-          echo "IMAGE_LATEST=ghcr.io/${OWNER_LC}/${NAME_LC}:latest" >> $GITHUB_ENV
+      - name: 🔧 Set up Buildx (docker-container driver)
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker-container
 
-      - name: 📦 Login to GitHub Container Registry
+      - name: 🏷️ Read version/artifact and compose image tags (lowercase owner/repo)
+        run: |
+          VERSION=$(mvn -q help:evaluate -Dexpression=project.version -DforceStdout)
+          ARTIFACT=$(mvn -q help:evaluate -Dexpression=project.artifactId -DforceStdout)
+          REPO_LC=$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')
+
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "ARTIFACT=$ARTIFACT" >> $GITHUB_ENV
+          echo "IMAGE=${{ env.REGISTRY }}/${REPO_LC}" >> $GITHUB_ENV
+          echo "IMAGE_VERSION=${{ env.REGISTRY }}/${REPO_LC}:${VERSION}" >> $GITHUB_ENV
+          echo "IMAGE_LATEST=${{ env.REGISTRY }}/${REPO_LC}:latest" >> $GITHUB_ENV
+          echo "Using image: ghcr.io/${REPO_LC}:${VERSION}"
+
+      - name: 🔐 Login GHCR (GITHUB_TOKEN)
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.GHCR_URL }}
+          registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GHCR_PERSONAL_ACCESS_TOKEN }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 🐳 Build & Push Docker image
-        uses: docker/build-push-action@v4
+      - name: 🐳 Build & Push (version + latest) with GHA cache
+        uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           tags: |
-            ${{ env.IMAGE }}
+            ${{ env.IMAGE_VERSION }}
             ${{ env.IMAGE_LATEST }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
-      - name: 🚀 Deploy on Render
+      # Guarda en GitHub → Settings → Secrets and variables → Actions:
+      # RENDER_DEPLOY_HOOK con la URL COMPLETA del hook (no solo el token)
+      - name: 🚀 Trigger Render Deploy Hook
         run: |
-          curl --fail -X POST "https://api.render.com/deploy/${{ secrets.RENDER_DEPLOY_HOOK_TOKEN }}" \
-          && echo "✅ Deployment succeeded" \
-          || (echo "❌ Deployment failed" && exit 1)
+          if [ -n "${{ secrets.RENDER_DEPLOY_HOOK }}" ]; then
+            curl -fsS -X POST "${{ secrets.RENDER_DEPLOY_HOOK }}"
+            echo "Render deploy hook triggered."
+          else
+            echo "⚠️ No RENDER_DEPLOY_HOOK secret set; skipping."
+          fi
